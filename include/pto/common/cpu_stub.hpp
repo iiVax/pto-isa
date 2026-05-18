@@ -267,4 +267,38 @@ struct is_event : std::false_type {};
 template <typename... Ts>
 inline constexpr bool all_events_v = (is_event<Ts>::value && ...);
 
+namespace pto {
+template <SyncCoreType CoreType = SyncCoreType::AIVOnly>
+inline void SYNCALL_IMPL()
+{
+    (void)CoreType;
+}
+
+template <SyncCoreType CoreType = SyncCoreType::AIVOnly>
+inline void SYNCALL_SOFT_IMPL(int32_t *gmWorkspace, int32_t *ubWorkspace, int32_t usedCores)
+{
+    (void)CoreType;
+    (void)gmWorkspace;
+    (void)ubWorkspace;
+    (void)usedCores;
+}
+
+inline void SYNCALL_SOFT_AIC_IMPL(int32_t *gmWorkspace, int32_t *l1Workspace, int32_t usedCores)
+{
+    (void)gmWorkspace;
+    (void)l1Workspace;
+    (void)usedCores;
+}
+
+template <SyncCoreType CoreType = SyncCoreType::Mix>
+inline void SYNCALL_SOFT_MIX_IMPL(int32_t *gmWorkspace, int32_t *ubWorkspace, int32_t *l1Workspace, int32_t usedCores)
+{
+    (void)CoreType;
+    (void)gmWorkspace;
+    (void)ubWorkspace;
+    (void)l1Workspace;
+    (void)usedCores;
+}
+} // namespace pto
+
 #endif

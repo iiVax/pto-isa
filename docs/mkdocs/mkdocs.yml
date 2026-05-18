@@ -123,6 +123,7 @@ nav:
           - Sync And Config:
               - Instruction Set Contract: docs/isa/tile/sync-and-config.md
               - pto.tsync: docs/isa/tile/ops/sync-and-config/tsync.md
+              - pto.syncall: docs/isa/tile/ops/sync-and-config/syncall.md
               - pto.tassign: docs/isa/tile/ops/sync-and-config/tassign.md
               - pto.talias: docs/isa/tile/ops/sync-and-config/talias.md
               - pto.sethf32mode: docs/isa/tile/ops/sync-and-config/sethf32mode.md
