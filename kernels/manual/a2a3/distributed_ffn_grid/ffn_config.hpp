@@ -38,37 +38,50 @@ constexpr int FFN_GRID_COLS = CONFIG_GRID_COLS;
 constexpr int FFN_TOKEN_TILE = CONFIG_TOKEN_TILE;
 constexpr int FFN_MODEL_TILE = CONFIG_MODEL_TILE;
 constexpr int FFN_FFN_TILE = CONFIG_FFN_TILE;
+constexpr int FFN_MODEL_SHARD_TILE = FFN_MODEL_TILE / FFN_GRID_COLS;
+constexpr int FFN_FFN_TOTAL_TILE = FFN_FFN_TILE * FFN_GRID_COLS;
 
 constexpr int FFN_TILE_ELEMS = FFN_TOKEN_TILE * FFN_MODEL_TILE;
 constexpr int FFN_TILE_BYTES = FFN_TILE_ELEMS * 2; // half
 
-// GridPipe EAST reduce carries fp32 [T, H] down partial tiles.
+// ReduceSum uses GridPipe to carry fp32 [T, H] down partial tiles.
+// AllGather uses GridPipe to carry fp16 [T, Fi] hidden shards before down.
+#ifdef CONFIG_FFN_GRID_ALLGATHER
+constexpr int FFN_SLOT_BYTES = FFN_TOKEN_TILE * FFN_FFN_TILE * 2;
+#else
 constexpr int FFN_SLOT_BYTES = FFN_TOKEN_TILE * FFN_MODEL_TILE * 4;
+#endif
 constexpr int FFN_SLOT_COUNT = 4;
 
 // Host-visible mirror of pto::a2a3_grid::kWindowBytes<FFN_SLOT_BYTES, FFN_SLOT_COUNT>().
 // Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp:
-//   layout = kFlagsBytes (64) + 4 dirs * SlotCount * SlotBytes.
-constexpr int FFN_GRID_FLAGS_BYTES = 64;
-constexpr int FFN_GRID_WINDOW_BYTES = FFN_GRID_FLAGS_BYTES + 4 * FFN_SLOT_COUNT * FFN_SLOT_BYTES;
+//   layout = kFlagsBytes (128) + 5 dirs * SlotCount * SlotBytes.
+constexpr int FFN_GRID_DIRECTION_COUNT = 5;
+constexpr int FFN_GRID_FLAGS_BYTES = 128;
+constexpr int FFN_GRID_WINDOW_BYTES = FFN_GRID_FLAGS_BYTES + FFN_GRID_DIRECTION_COUNT * FFN_SLOT_COUNT * FFN_SLOT_BYTES;
 
 // ---------------------------------------------------------------------------
 // Per-cell weight + golden byte sizes.
 //   - W_gate [H, Fi]   fp16   = FFN_MODEL_TILE * FFN_FFN_TILE * 2
 //   - W_up   [H, Fi]   fp16   = FFN_MODEL_TILE * FFN_FFN_TILE * 2
-//   - W_down [Fi, H]   fp16   = FFN_FFN_TILE  * FFN_MODEL_TILE * 2
+//   - W_down [Fi, H]   fp16   = FFN_FFN_TILE  * FFN_MODEL_TILE * 2 in ReduceSum mode
+//   - W_down [F, Hc]   fp16   = FFN_FFN_TOTAL_TILE * FFN_MODEL_SHARD_TILE * 2 in AllGather mode
 //   - golden_per_row [T, H]   fp32   = FFN_TOKEN_TILE * FFN_MODEL_TILE * 4
 //     (each row owns one [T, H] slice of yOutput; the block with col == cols-1
 //      writes its row's slice)
 //   - golden_total   [T_total, H]    fp32   = FFN_GRID_ROWS * FFN_GOLDEN_BYTES
 //     (full file on disk; data-parallel rows split T across rows)
-// Source of truth for both scripts/gen_data.py and main.cpp aclrtMalloc.
-// If dtype or T_total layout changes, update gen_data.py AND main.cpp LoadWeights
+// Source of truth for scripts/gen_data.py and both host drivers' aclrtMalloc.
+// If dtype or T_total layout changes, update gen_data.py and the host driver LoadWeights
 // / VerifyOutput together.
 // ---------------------------------------------------------------------------
 constexpr int FFN_W_GATE_BYTES = FFN_MODEL_TILE * FFN_FFN_TILE * 2;
 constexpr int FFN_W_UP_BYTES = FFN_MODEL_TILE * FFN_FFN_TILE * 2;
+#ifdef CONFIG_FFN_GRID_ALLGATHER
+constexpr int FFN_W_DOWN_BYTES = FFN_FFN_TOTAL_TILE * FFN_MODEL_SHARD_TILE * 2;
+#else
 constexpr int FFN_W_DOWN_BYTES = FFN_FFN_TILE * FFN_MODEL_TILE * 2;
+#endif
 constexpr int FFN_GOLDEN_BYTES = FFN_TOKEN_TILE * FFN_MODEL_TILE * 4;
 constexpr int FFN_GOLDEN_TOTAL_BYTES = FFN_GRID_ROWS * FFN_GOLDEN_BYTES;
 
@@ -89,7 +102,12 @@ constexpr int FFN_X_BYTES = FFN_TOKEN_TILE * FFN_MODEL_TILE * 2;
 constexpr int FFN_GATE_PARTIAL_BYTES = FFN_TOKEN_TILE * FFN_FFN_TILE * 4;
 constexpr int FFN_UP_PARTIAL_BYTES = FFN_TOKEN_TILE * FFN_FFN_TILE * 4;
 constexpr int FFN_HIDDEN_BYTES = FFN_TOKEN_TILE * FFN_FFN_TILE * 2;
+constexpr int FFN_HIDDEN_FULL_BYTES = FFN_TOKEN_TILE * FFN_FFN_TOTAL_TILE * 2;
+#ifdef CONFIG_FFN_GRID_ALLGATHER
+constexpr int FFN_DOWN_PARTIAL_BYTES = FFN_TOKEN_TILE * FFN_MODEL_SHARD_TILE * 4;
+#else
 constexpr int FFN_DOWN_PARTIAL_BYTES = FFN_TOKEN_TILE * FFN_MODEL_TILE * 4;
+#endif
 
 // Matches FFN_GOLDEN_BYTES / golden.bin for direct fp32 comparison.
 constexpr int FFN_Y_OUTPUT_BYTES = FFN_TOKEN_TILE * FFN_MODEL_TILE * 4;

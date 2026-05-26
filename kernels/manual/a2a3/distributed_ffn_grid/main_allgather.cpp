@@ -8,12 +8,11 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// Single-device multi-block FFN GridPipe driver.
+// Single-device multi-block FFN GridPipe AllGather driver.
 //
 // gridRows*gridCols blocks form a logical grid on one NPU.  Each cell computes
-// one model-parallel FFN shard, then cells in the same row reduce their fp32
-// down partials through a same-device GridPipe EAST mock backed by local GM
-// windows and a fake HcclDeviceContext.
+// one model-parallel FFN shard, then cells in the same row AllGather fp16
+// hidden shards before down projection.  Down is sharded by output H columns.
 
 #include <chrono>
 #include <climits>
@@ -65,7 +64,7 @@ struct DeviceResources {
     void *hidden_dev = nullptr;
     void *down_partial_dev = nullptr;
     void *y_output_dev = nullptr;
-    void *reduce_pipe_windows_dev = nullptr;
+    void *gather_pipe_windows_dev = nullptr;
     void *fake_hccl_ctx_dev = nullptr;
     uint64_t ffts = 0;
     uint32_t fftsLen = 0;
@@ -82,7 +81,7 @@ struct DeviceResources {
     size_t hiddenBytes = 0;
     size_t downPartialBytes = 0;
     size_t yOutputBytes = 0;
-    size_t reducePipeBytes = 0;
+    size_t gatherPipeBytes = 0;
 
     std::string dataDir = "./out";
 };
@@ -175,18 +174,18 @@ static bool InitAcl(int device_id)
 
 static bool InitLocalGridPipeContext(DeviceResources &r)
 {
-    r.reducePipeBytes = r.cells * static_cast<size_t>(FFN_GRID_WINDOW_BYTES);
-    if (aclrtMalloc(&r.reduce_pipe_windows_dev, r.reducePipeBytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
-        std::cerr << "[ERROR] aclrtMalloc(reduce_pipe_windows) failed" << std::endl;
+    r.gatherPipeBytes = r.cells * static_cast<size_t>(FFN_GRID_WINDOW_BYTES);
+    if (aclrtMalloc(&r.gather_pipe_windows_dev, r.gatherPipeBytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+        std::cerr << "[ERROR] aclrtMalloc(gather_pipe_windows) failed" << std::endl;
         return false;
     }
-    aclrtMemset(r.reduce_pipe_windows_dev, r.reducePipeBytes, 0, r.reducePipeBytes);
+    aclrtMemset(r.gather_pipe_windows_dev, r.gatherPipeBytes, 0, r.gatherPipeBytes);
 
     HcclDeviceContext hostCtx{};
     hostCtx.rankId = 0;
     hostCtx.rankNum = static_cast<uint32_t>(r.cells);
     hostCtx.winSize = static_cast<uint64_t>(FFN_GRID_WINDOW_BYTES);
-    uint64_t base = reinterpret_cast<uint64_t>(r.reduce_pipe_windows_dev);
+    uint64_t base = reinterpret_cast<uint64_t>(r.gather_pipe_windows_dev);
     for (size_t i = 0; i < r.cells && i < HCCL_MAX_RANK_NUM; ++i) {
         hostCtx.windowsIn[i] = base + i * static_cast<size_t>(FFN_GRID_WINDOW_BYTES);
         hostCtx.windowsOut[i] = hostCtx.windowsIn[i];
@@ -211,6 +210,10 @@ static bool AllocateResources(DeviceResources &r)
                   << std::endl;
         return false;
     }
+    if (FFN_MODEL_TILE % FFN_GRID_COLS != 0) {
+        std::cerr << "[ERROR] AllGather split requires MODEL_TILE divisible by GRID_COLS" << std::endl;
+        return false;
+    }
     if (const char *env = std::getenv("FFN_GRID_DATA_DIR")) {
         r.dataDir = env;
     }
@@ -226,7 +229,7 @@ static bool AllocateResources(DeviceResources &r)
     r.wDownBytes = r.cells * static_cast<size_t>(FFN_W_DOWN_BYTES);
     r.gatePartialBytes = r.cells * static_cast<size_t>(FFN_GATE_PARTIAL_BYTES);
     r.upPartialBytes = r.cells * static_cast<size_t>(FFN_UP_PARTIAL_BYTES);
-    r.hiddenBytes = r.cells * static_cast<size_t>(FFN_HIDDEN_BYTES);
+    r.hiddenBytes = r.cells * static_cast<size_t>(FFN_HIDDEN_FULL_BYTES);
     r.downPartialBytes = r.cells * static_cast<size_t>(FFN_DOWN_PARTIAL_BYTES);
     r.yOutputBytes = r.rows * static_cast<size_t>(FFN_Y_OUTPUT_BYTES);
 
@@ -264,7 +267,7 @@ static bool AllocateResources(DeviceResources &r)
     }
 
     std::cout << "[INFO] grid=" << r.rows << "x" << r.cols << " cells=" << r.cells << " dataDir=" << r.dataDir
-              << " reducePipeBytes=" << r.reducePipeBytes << " yOutputBytes=" << r.yOutputBytes << std::endl;
+              << " gatherPipeBytes=" << r.gatherPipeBytes << " yOutputBytes=" << r.yOutputBytes << std::endl;
     return true;
 }
 
@@ -344,7 +347,7 @@ static bool VerifyOutput(DeviceResources &r)
         return false;
     }
 
-    std::cout << "[INFO] ResultCmp single-device GridPipe EAST-reduced output vs golden:" << std::endl;
+    std::cout << "[INFO] ResultCmp single-device GridPipe AllGather output shards vs golden:" << std::endl;
     return PtoTestCommon::ResultCmp(golden, outHost.data(), 0.001f);
 }
 
@@ -358,6 +361,8 @@ static const char *GridPipeFaultName(uint32_t code)
         case 0x103:
             return "push west boundary";
         case 0x104:
+            return "push south boundary";
+        case 0x105:
             return "push source boundary";
         case 0x201:
             return "pop north boundary";
@@ -365,6 +370,8 @@ static const char *GridPipeFaultName(uint32_t code)
             return "pop east boundary";
         case 0x203:
             return "pop west boundary";
+        case 0x204:
+            return "pop south boundary";
         case 0x301:
             return "wait ready timeout";
         case 0x302:
@@ -379,7 +386,7 @@ static bool CheckGridPipeFaults(DeviceResources &r)
     constexpr size_t kFlagWordsPerWindow = static_cast<size_t>(FFN_GRID_FLAGS_BYTES) / sizeof(uint32_t);
     std::vector<uint32_t> flags(r.cells * kFlagWordsPerWindow, 0);
     for (size_t cell = 0; cell < r.cells; ++cell) {
-        auto *src = reinterpret_cast<uint8_t *>(r.reduce_pipe_windows_dev) + cell * FFN_GRID_WINDOW_BYTES;
+        auto *src = reinterpret_cast<uint8_t *>(r.gather_pipe_windows_dev) + cell * FFN_GRID_WINDOW_BYTES;
         auto *dst = flags.data() + cell * kFlagWordsPerWindow;
         if (aclrtMemcpy(dst, kFlagWordsPerWindow * sizeof(uint32_t), src, kFlagWordsPerWindow * sizeof(uint32_t),
                         ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
@@ -412,9 +419,9 @@ static void Cleanup(DeviceResources &r)
         aclrtFree(r.fake_hccl_ctx_dev);
         r.fake_hccl_ctx_dev = nullptr;
     }
-    if (r.reduce_pipe_windows_dev) {
-        aclrtFree(r.reduce_pipe_windows_dev);
-        r.reduce_pipe_windows_dev = nullptr;
+    if (r.gather_pipe_windows_dev) {
+        aclrtFree(r.gather_pipe_windows_dev);
+        r.gather_pipe_windows_dev = nullptr;
     }
     if (r.w_gate_dev) {
         aclrtFree(r.w_gate_dev);
@@ -468,8 +475,8 @@ static bool RunSingleDevice()
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    launchDistributedFfnGridMixedKernel(
-        reinterpret_cast<uint8_t *>(r.ffts), reinterpret_cast<uint8_t *>(r.reduce_pipe_windows_dev),
+    launchDistributedFfnGridAllGatherMixedKernel(
+        reinterpret_cast<uint8_t *>(r.ffts), reinterpret_cast<uint8_t *>(r.gather_pipe_windows_dev),
         reinterpret_cast<uint8_t *>(r.x_dev), reinterpret_cast<uint8_t *>(r.w_gate_dev),
         reinterpret_cast<uint8_t *>(r.w_up_dev), reinterpret_cast<uint8_t *>(r.w_down_dev),
         reinterpret_cast<uint8_t *>(r.gate_partial_dev), reinterpret_cast<uint8_t *>(r.up_partial_dev),
@@ -500,16 +507,15 @@ int main(int argc, char **argv)
     }
 
     std::cout << "\n================================================================" << std::endl;
-    std::cout << "  Single-device multi-block FFN GridPipe demo" << std::endl;
+    std::cout << "  Single-device multi-block FFN GridPipe AllGather demo" << std::endl;
     std::cout << "  grid=" << FFN_GRID_ROWS << "x" << FFN_GRID_COLS << " cells=" << (FFN_GRID_ROWS * FFN_GRID_COLS)
               << " tile=" << FFN_TOKEN_TILE << "x" << FFN_MODEL_TILE << " ffnTile=" << FFN_FFN_TILE << std::endl;
-    std::cout << "  Mode: row=data-parallel, col=model-parallel on one device; EAST reduce uses local GM windows"
-              << std::endl;
+    std::cout << "  Mode: hidden AllGather across cols, down split by output H columns" << std::endl;
     std::cout << "================================================================" << std::endl;
 
     bool ok = RunSingleDevice();
-    std::cout << (ok ? "[SUCCESS] Single-device multi-block FFN GridPipe PASS." :
-                       "[FAILED] Single-device multi-block FFN GridPipe FAILED.")
+    std::cout << (ok ? "[SUCCESS] Single-device multi-block FFN GridPipe AllGather PASS." :
+                       "[FAILED] Single-device multi-block FFN GridPipe AllGather FAILED.")
               << std::endl;
     aclrtResetDevice(deviceId);
     aclFinalize();

@@ -2,7 +2,7 @@
 
 ## 整体目标
 
-`distributed_ffn_grid` 当前用于验证 A2/A3 上的单卡逻辑 FFN 网格。host 在选定 device 上启动单进程，并 launch `gridRows * gridCols` 个 block。每个 block 对应一个逻辑 cell：
+`distributed_ffn_grid_reducesum` 当前用于验证 A2/A3 上的单卡逻辑 FFN 网格。host 在选定 device 上启动单进程，并 launch `gridRows * gridCols` 个 block。每个 block 对应一个逻辑 cell：
 
 - `gridRows` 是 data-parallel token 分片。
 - `gridCols` 是 model-parallel FFN intermediate 分片。
@@ -11,17 +11,22 @@
 
 `EAST` reduce 使用 A2/A3 GridPipe mock backend：本地 SRAM windows（当前由 GM 分配模拟）、fake `HcclDeviceContext` window 指针、ready/free counter、`dcci/dsb` fence 和 spin wait。该 demo 验证的是单设备 mock 路径和 GridPipe 编程模型，不是多卡通信验证。
 
+仓内同时提供一个 AllGather 版本：`run_allgather.sh` / `distributed_ffn_grid_allgather`。它在 hidden 阶段先沿列做 fp16 AllGather，再让 down 阶段按输出 `H` 维切片，去掉 post-down ReduceSum。
+
 ## 文件作用
 
 | 文件 | 作用 |
 | --- | --- |
 | `README_zh.md` / `README.md` | 中文 / 英文说明文档。 |
-| `CMakeLists.txt` | 构建 host 可执行文件和 mixed Cube/Vec device kernel shared library。 |
-| `run.sh` | 一键设置 CANN 环境、生成输入数据、配置 CMake、编译并在单进程中启动 demo。 |
+| `CMakeLists.txt` | 构建 host 可执行文件和 mixed Cube/Vec device kernel shared libraries。 |
+| `run_reducesum.sh` | ReduceSum 版本的一键构建、数据生成和运行脚本。 |
+| `run_allgather.sh` | AllGather 版本的一键构建、数据生成和运行脚本。 |
 | `ffn_config.hpp` | 编译期配置：逻辑网格尺寸、tile 尺寸、GridPipe window 字节数、buffer 字节数、PReLU alpha。 |
 | `kernel_launch.hpp` | host 侧 mixed kernel launch 接口声明。 |
-| `main.cpp` | host driver：ACL 初始化、fake HCCL context/local GridPipe windows、device buffer 分配、数据加载、kernel launch、golden 校验和资源清理。 |
-| `distributed_ffn_grid_compute_kernel.cpp` | mixed Cube/Vec kernel。Cube 负责 GEMM，Vec 负责 activation/cast 和 GridPipe `EAST` reduce。 |
+| `main_reducesum.cpp` | ReduceSum host driver：ACL 初始化、fake HCCL context/local GridPipe windows、device buffer 分配、数据加载、kernel launch、golden 校验和资源清理。 |
+| `distributed_ffn_grid_reducesum_compute_kernel.cpp` | ReduceSum mixed Cube/Vec kernel。Cube 负责 GEMM，Vec 负责 activation/cast 和 GridPipe `EAST` reduce。 |
+| `main_allgather.cpp` | AllGather host driver。 |
+| `distributed_ffn_grid_allgather_compute_kernel.cpp` | AllGather mixed Cube/Vec kernel。Vec 负责 hidden shard 收集，Cube 写出 output-H shard。 |
 | `gridpipe_payload_inl.hpp` | 本地 GridPipe payload/remote pointer adaptor。 |
 | `../../../../include/pto/common/grid_counter_intrinsic.hpp` | CCE intrinsic 风格的 neighbor counter API，GridPipe ready/free wait 与 notify 会经过这里。 |
 | `../../../../include/pto/common/grid_sram_intrinsic.hpp` | CCE intrinsic 风格的 neighbor SRAM 地址解析和 payload 搬运 API，GridPipe payload movement 会经过这里。 |
@@ -31,11 +36,11 @@
 
 ## 运行流程
 
-1. `run.sh` 解析参数。默认 `gridRows=2`、`gridCols=2`、`T=16`、`H=64`、`Fi=64`、`n-ranks=1`。
+1. `run_reducesum.sh` 解析参数。默认 `gridRows=2`、`gridCols=2`、`T=16`、`H=64`、`Fi=64`、`n-ranks=1`。
 2. 如果没有指定 `--build-only`，`scripts/gen_data.py` 生成 per-cell 输入、权重文件和 `golden.bin`。
 3. CMake 构建两个 target：
-   - `distributed_ffn_grid_mixed_kernel`：`dav-c220` mixed Cube/Vec kernel。
-   - `distributed_ffn_grid`：host 可执行文件。
+   - `distributed_ffn_grid_reducesum_mixed_kernel`：`dav-c220` mixed Cube/Vec kernel。
+   - `distributed_ffn_grid_reducesum`：host 可执行文件。
 4. host 在选定 device 上初始化 ACL。
 5. host 按 `gridRows * gridCols` 个 cell 分配连续 device buffers。
 6. host 分配每个 cell 一个本地 GridPipe SRAM window（当前用 GM backing），并构造 fake `HcclDeviceContext`：
@@ -88,7 +93,7 @@ col  = cell % gridCols
 
 ### 3. 本地 GridPipe mock
 
-host 分配 `gridRows * gridCols` 个本地 SRAM windows（当前由 GM backing）。`TPUSH<EAST>` 通过 `get_neighbor_ubuf_addr` 解析 east neighbor 的 Vector UB slot 后写入 payload，再发布 ready counter；`TPOP<EAST>` 等待本地 ready counter、读取本地 UB slot，并向 west neighbor 归还 free credit。
+host 分配 `gridRows * gridCols` 个本地 SRAM windows（当前由 GM backing）。`TPUSH<EAST>` 通过 `get_neighbor_sram_addr` 解析 east neighbor 的 SRAM slot 后写入 payload，再发布 ready counter；`TPOP<EAST>` 等待本地 ready counter、读取本地 SRAM slot，并向 west neighbor 归还 free credit。
 
 mock 使用 GM flag polling 和 cache maintenance 在 A2/A3 上模拟 LPU WSE 预期的 `SPR` / `WFE` 行为。
 
@@ -101,12 +106,11 @@ GridPipe 的 ready/free 同步统一经过 `include/pto/common/grid_counter_intr
 
 GridPipe payload 的远端 SRAM 地址解析统一经过 `include/pto/common/grid_sram_intrinsic.hpp`：
 
-- `get_neighbor_ubuf_addr(dst, src, dir, peerRank, operand)` / `get_neighbor_cbuf_addr(dst, src, dir, peerRank, operand)`：将本地 slot offset 解析为邻居 Vector UB 或 Cube L1/CBUF slot 地址寄存器。
-- `copy_ubuf_to_neighbor_ubuf(dst, src, bytes, config)` / `copy_ubuf_to_neighbor_cbuf(dst, src, bytes, config)`：Vector UB 到邻居 Vector UB 或 Cube L1 的写入接口。
-- `copy_cbuf_to_neighbor_ubuf(dst, src, bytes, config)` / `copy_cbuf_to_neighbor_cbuf(dst, src, bytes, config)`：Cube L1 到邻居 Vector UB 或 Cube L1 的写入接口。
-- `copy_neighbor_ubuf_to_ubuf(dst, src, bytes, config)`：A2/A3 mock 中 TPOP 侧从本地 GM-backed slot 加载到 consumer Vector UB tile 的接口；native Grid TPOP 预期通过硬件 SRAM 地址机制绑定本地 slot。
+- `get_neighbor_sram_addr(dst, src, dir, peerRank, operand)`：将本地 slot offset 解析为邻居 SRAM slot 地址寄存器。
+- `copy_sram_to_neighbor_sram(dst, src, bytes, config)`：本核 SRAM 到邻居核 SRAM 的写入接口，不再区分 UB/CBUF。
+- `copy_neighbor_sram_to_sram(dst, src, bytes, config)`：对应的跨核读接口。native lowering 当前仅提供接口占位；A2/A3 mock 用它做 TPOP 侧 GM-backed slot 校验。
 
-当前 A2/A3 mock 中，UB 源路径通过 GM-backed fake window 上的 MTE 搬运实现；`__cbuf__` 源路径通过现有 `copy_cbuf_to_gm` 写入 GM-backed fake window。native 硬件提供对应 builtin 后，上层 GridPipe 调用点不需要修改。
+当前 A2/A3 mock 中，SRAM 写入/读取路径通过 GM-backed fake window 上的 MTE 搬运实现。native 硬件提供对应写 builtin 后，上层 GridPipe 调用点不需要修改。
 
 `TPUSH<EAST>` 先用 `wfe_neighbor_counter` 等待 `Free` credit，写 payload slot，然后用 `mtspr_neighbor_counter` 发布 `Ready`。`TPOP<EAST>` 先等待 `Ready`，读取 payload slot，再向上游发布 `Free`。
 
@@ -116,18 +120,24 @@ GridPipe payload 的远端 SRAM 地址解析统一经过 `include/pto/common/gri
 
 reduce slot 携带 fp32 `[T, H]`，所以 `FFN_SLOT_BYTES = T * H * 4`。`downPartial`、`yOutput` 和 `golden.bin` 都保持 fp32，host 可直接做容差比较。
 
+### 6. AllGather 版本
+
+`run_allgather.sh` 使用 `scripts/gen_data.py --split-mode allgather` 生成数据。此时 `W_down` 按 `[F, Hc]` 切列，`GridPipe` 搬运的是 fp16 `hidden [T, Fi]`，最终输出是每列一个 `Y[:, Hc]` shard，host 仍与完整 `golden.bin` 做拼接后的比对。AllGather 要求 `--model-tile` 能被 `--grid-cols` 整除，保证 `Hc = H / gridCols` 是整数 tile 宽度。
+
 ## 运行方法
 
 ### 仅编译
 
 ```bash
-bash run.sh --build-only -v Ascend910B1 --grid-rows 2 --grid-cols 2
+bash run_reducesum.sh --build-only -v Ascend910B1 --grid-rows 2 --grid-cols 2
+bash run_allgather.sh --build-only -v Ascend910B1 --grid-rows 2 --grid-cols 2
 ```
 
 ### NPU 运行
 
 ```bash
-bash run.sh -r npu -v Ascend910B1 --device-id 0 --grid-rows 3 --grid-cols 3
+bash run_reducesum.sh -r npu -v Ascend910B1 --device-id 0 --grid-rows 3 --grid-cols 3
+bash run_allgather.sh -r npu -v Ascend910B1 --device-id 0 --grid-rows 3 --grid-cols 3 --model-tile 96
 ```
 
 ### 常用参数
@@ -136,19 +146,25 @@ bash run.sh -r npu -v Ascend910B1 --device-id 0 --grid-rows 3 --grid-cols 3
 -r, --run-mode      sim 或 npu，默认 npu
 -v, --soc-version   默认 Ascend910B1
 -n, --n-ranks       固定为 1
--d, --device-id     ACL device id，默认 0
+-d, --device-id     ACL device id；默认依次取 FFN_GRID_DEVICE_ID、ASCEND_DEVICE_ID、DEVICE_ID、0
 --grid-rows         单卡逻辑网格行数，默认 2
 --grid-cols         单卡逻辑网格列数，默认 2
 --token-tile        每个 cell 的 token tile T，默认 16
---model-tile        hidden dim H，默认 64
+--model-tile        hidden dim H，默认 64；AllGather 要求 H % gridCols == 0
 --ffn-tile          每列 intermediate dim Fi，默认 64
 --build-only        只编译，不生成数据和运行
 ```
 
 ## 期望输出
 
-成功时最终打印：
+ReduceSum 成功时最终打印：
 
 ```text
 [SUCCESS] Single-device multi-block FFN GridPipe PASS.
+```
+
+AllGather 成功时最终打印：
+
+```text
+[SUCCESS] Single-device multi-block FFN GridPipe AllGather PASS.
 ```

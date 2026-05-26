@@ -21,13 +21,13 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //        peerRank's window.  On A2/A3 this SRAM window is mocked by local GM
 //        windows and HcclRemotePtr.
 //
-//   CopyTileToNeighborUbufSlot<TileT>(remoteSlot, tile, slotBytes)
+//   CopyTileToNeighborSramSlot<TileT>(remoteSlot, tile, slotBytes)
 //     -> Tile-to-intrinsic adapter: extract the Tile UB pointer, then call
-//        copy_ubuf_to_neighbor_ubuf(...).
+//        copy_sram_to_neighbor_sram(...).
 //
-//   CopyNeighborUbufSlotToTile<TileT>(tile, localSlot, slotBytes)
+//   CopyNeighborSramSlotToTile<TileT>(tile, localSlot, slotBytes)
 //     -> Tile-to-intrinsic adapter: extract the Tile UB pointer, then call
-//        copy_neighbor_ubuf_to_ubuf(...).
+//        copy_neighbor_sram_to_sram(...).
 //
 // The skeleton implementation converts Tile descriptors to UB pointers, then
 // lets grid_sram_intrinsic.hpp choose native builtin vs A2/A3 mock lowering.
@@ -63,11 +63,6 @@ AICORE inline neighbor_sram_addr LocalSramAddr(__gm__ uint8_t *localSlot)
     return neighbor_sram_addr{reinterpret_cast<uint64_t>(localSlot)};
 }
 
-AICORE inline neighbor_ubuf_addr LocalUbufAddr(__gm__ uint8_t *localSlot)
-{
-    return neighbor_ubuf_addr{reinterpret_cast<uint64_t>(localSlot)};
-}
-
 AICORE inline __gm__ uint32_t *RemoteCounterPtr(__gm__ void *runtimeCtx, __gm__ uint32_t *localCounter, int peerRank)
 {
     uint64_t remoteAddr = ResolvePeerWindowAddress(runtimeCtx, reinterpret_cast<uint64_t>(localCounter), peerRank);
@@ -75,19 +70,19 @@ AICORE inline __gm__ uint32_t *RemoteCounterPtr(__gm__ void *runtimeCtx, __gm__ 
 }
 
 template <typename TileT>
-__tf__ AICORE inline void CopyTileToNeighborUbufSlot(neighbor_ubuf_addr remoteSlot, TileT &tile, int slotBytes)
+__tf__ AICORE inline void CopyTileToNeighborSramSlot(neighbor_sram_addr remoteSlot, TileT &tile, int slotBytes)
 {
-    __ubuf__ void *src = reinterpret_cast<__ubuf__ void *>(__cce_get_tile_ptr(tile.data()));
+    neighbor_sram_addr src{reinterpret_cast<uint64_t>(__cce_get_tile_ptr(tile.data()))};
     // Producer-side cross-core payload transfer in CCE-intrinsic form.
-    copy_ubuf_to_neighbor_ubuf(remoteSlot, src, static_cast<uint32_t>(slotBytes), 0);
+    copy_sram_to_neighbor_sram(remoteSlot, src, static_cast<uint32_t>(slotBytes), 0);
 }
 
 template <typename TileT>
-__tf__ AICORE inline void CopyNeighborUbufSlotToTile(TileT &tile, neighbor_ubuf_addr localSlot, int slotBytes)
+__tf__ AICORE inline void CopyNeighborSramSlotToTile(TileT &tile, neighbor_sram_addr localSlot, int slotBytes)
 {
-    __ubuf__ void *dst = reinterpret_cast<__ubuf__ void *>(__cce_get_tile_ptr(tile.data()));
+    neighbor_sram_addr dst{reinterpret_cast<uint64_t>(__cce_get_tile_ptr(tile.data()))};
     // Consumer-side counterpart of the same intrinsic-style payload transfer.
-    copy_neighbor_ubuf_to_ubuf(dst, localSlot, static_cast<uint32_t>(slotBytes), 0);
+    copy_neighbor_sram_to_sram(dst, localSlot, static_cast<uint32_t>(slotBytes), 0);
 }
 
 } // namespace a2a3_grid_payload
@@ -99,15 +94,15 @@ AICORE inline uint64_t MockGetNeighborSramAddr(__gm__ void *runtimeCtx, uint64_t
     return a2a3_grid_payload::ResolvePeerWindowAddress(runtimeCtx, localSramAddr, peerRank);
 }
 
-AICORE inline void MockCopyUbufToNeighborUbuf(neighbor_ubuf_addr dst, __ubuf__ void *src, uint32_t bytes,
+AICORE inline void MockCopySramToNeighborSram(neighbor_sram_addr dst, neighbor_sram_addr src, uint32_t bytes,
                                               uint64_t config)
 {
     (void)config;
-    // A2/A3 mock lowering of copy_ubuf_to_neighbor_ubuf:
-    // UB(local core) -> GM-backed peer slot window.
+    // A2/A3 mock lowering of copy_sram_to_neighbor_sram:
+    // SRAM(local core, currently tile UB) -> GM-backed peer slot window.
     constexpr uint32_t kChunkBytes = 256;
     auto *dstBytes = reinterpret_cast<__gm__ uint8_t *>(dst.value);
-    auto *srcBytes = reinterpret_cast<__ubuf__ uint8_t *>(src);
+    auto *srcBytes = reinterpret_cast<__ubuf__ uint8_t *>(src.value);
     uint32_t offset = 0;
     while (offset < bytes) {
         uint32_t chunk = (bytes - offset > kChunkBytes) ? kChunkBytes : (bytes - offset);
@@ -116,45 +111,14 @@ AICORE inline void MockCopyUbufToNeighborUbuf(neighbor_ubuf_addr dst, __ubuf__ v
     }
 }
 
-AICORE inline void MockCopyUbufToNeighborCbuf(neighbor_cbuf_addr dst, __ubuf__ void *src, uint32_t bytes,
+AICORE inline void MockCopyNeighborSramToSram(neighbor_sram_addr dst, neighbor_sram_addr src, uint32_t bytes,
                                               uint64_t config)
 {
     (void)config;
+    // A2/A3 mock lowering of copy_neighbor_sram_to_sram:
+    // GM-backed local slot window -> SRAM(local core, currently tile UB).
     constexpr uint32_t kChunkBytes = 256;
-    auto *dstBytes = reinterpret_cast<__gm__ uint8_t *>(dst.value);
-    auto *srcBytes = reinterpret_cast<__ubuf__ uint8_t *>(src);
-    uint32_t offset = 0;
-    while (offset < bytes) {
-        uint32_t chunk = (bytes - offset > kChunkBytes) ? kChunkBytes : (bytes - offset);
-        copy_ubuf_to_gm_align_b8(dstBytes + offset, srcBytes + offset, 0, 1, chunk, 0, 0, 0, 0);
-        offset += chunk;
-    }
-}
-
-AICORE inline void MockCopyCbufToNeighborUbuf(neighbor_ubuf_addr dst, __cbuf__ void *src, uint32_t bytes,
-                                              uint64_t config)
-{
-    (void)config;
-    copy_cbuf_to_gm(reinterpret_cast<__gm__ uint8_t *>(dst.value), reinterpret_cast<__cbuf__ uint8_t *>(src), 0, 1,
-                    static_cast<uint16_t>(bytes), 0, 0);
-}
-
-AICORE inline void MockCopyCbufToNeighborCbuf(neighbor_cbuf_addr dst, __cbuf__ void *src, uint32_t bytes,
-                                              uint64_t config)
-{
-    (void)config;
-    copy_cbuf_to_gm(reinterpret_cast<__gm__ uint8_t *>(dst.value), reinterpret_cast<__cbuf__ uint8_t *>(src), 0, 1,
-                    static_cast<uint16_t>(bytes), 0, 0);
-}
-
-AICORE inline void MockCopyNeighborUbufToUbuf(__ubuf__ void *dst, neighbor_ubuf_addr src, uint32_t bytes,
-                                              uint64_t config)
-{
-    (void)config;
-    // A2/A3 mock lowering of copy_neighbor_ubuf_to_ubuf:
-    // GM-backed local slot window -> UB(local core).
-    constexpr uint32_t kChunkBytes = 256;
-    auto *dstBytes = reinterpret_cast<__ubuf__ uint8_t *>(dst);
+    auto *dstBytes = reinterpret_cast<__ubuf__ uint8_t *>(dst.value);
     auto *srcBytes = reinterpret_cast<__gm__ uint8_t *>(src.value);
     uint32_t offset = 0;
     while (offset < bytes) {

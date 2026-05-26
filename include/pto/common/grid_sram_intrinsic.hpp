@@ -8,13 +8,14 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// CCE-intrinsic-style API for neighbor-core SRAM/UB/L1 addressing and transfer.
+// CCE-intrinsic-style API for neighbor-core SRAM addressing and transfer.
 // Grid TPUSH/TPOP calls this layer so the same protocol can use either native
 // __builtin_pto_* instructions or the current A2/A3 mock lowering.
 //
 // Grid TPUSH/TPOP payload movement targets neighbor-visible on-chip storage,
-// not a global-memory object in the hardware contract. Vector-core storage is
-// UB; Cube-core storage is L1/CBUF. Current A2/A3 demos emulate those neighbor
+// not a global-memory object in the hardware contract. Hardware exposes this
+// path as local SRAM <-> neighbor SRAM without distinguishing UB and CBUF in
+// the cross-core intrinsic names. Current A2/A3 demos emulate those neighbor
 // windows with local GM windows; the mock address operand is therefore kept as
 // backend context while the public API exposes address-register style values.
 
@@ -34,14 +35,6 @@ struct neighbor_sram_addr {
     uint64_t value = 0;
 };
 
-struct neighbor_ubuf_addr {
-    uint64_t value = 0;
-};
-
-struct neighbor_cbuf_addr {
-    uint64_t value = 0;
-};
-
 // Backend operand used only by the mock lowering. Native hardware ignores it
 // and derives the neighbor SRAM mapping from dir/peer configuration registers.
 struct NeighborSramOperand {
@@ -51,11 +44,8 @@ struct NeighborSramOperand {
 namespace grid_sram_mock {
 
 AICORE uint64_t MockGetNeighborSramAddr(__gm__ void *runtimeCtx, uint64_t localSramAddr, int32_t peerRank);
-AICORE void MockCopyUbufToNeighborUbuf(neighbor_ubuf_addr dst, __ubuf__ void *src, uint32_t bytes, uint64_t config);
-AICORE void MockCopyUbufToNeighborCbuf(neighbor_cbuf_addr dst, __ubuf__ void *src, uint32_t bytes, uint64_t config);
-AICORE void MockCopyCbufToNeighborUbuf(neighbor_ubuf_addr dst, __cbuf__ void *src, uint32_t bytes, uint64_t config);
-AICORE void MockCopyCbufToNeighborCbuf(neighbor_cbuf_addr dst, __cbuf__ void *src, uint32_t bytes, uint64_t config);
-AICORE void MockCopyNeighborUbufToUbuf(__ubuf__ void *dst, neighbor_ubuf_addr src, uint32_t bytes, uint64_t config);
+AICORE void MockCopySramToNeighborSram(neighbor_sram_addr dst, neighbor_sram_addr src, uint32_t bytes, uint64_t config);
+AICORE void MockCopyNeighborSramToSram(neighbor_sram_addr dst, neighbor_sram_addr src, uint32_t bytes, uint64_t config);
 
 } // namespace grid_sram_mock
 
@@ -75,86 +65,33 @@ AICORE inline void get_neighbor_sram_addr(neighbor_sram_addr &dst, neighbor_sram
 #endif
 }
 
-AICORE inline void get_neighbor_ubuf_addr(neighbor_ubuf_addr &dst, neighbor_sram_addr src, uint32_t dir,
-                                          int32_t peerRank, NeighborSramOperand operand = {})
-{
-#if defined(PTO_GRID_SRAM_NATIVE_INTRINSIC)
-    (void)operand;
-    dst.value = __builtin_pto_get_neighbor_ubuf_addr(src.value, dir, peerRank);
-#else
-    neighbor_sram_addr remote{};
-    get_neighbor_sram_addr(remote, src, dir, peerRank, operand);
-    dst.value = remote.value;
-#endif
-}
-
-AICORE inline void get_neighbor_cbuf_addr(neighbor_cbuf_addr &dst, neighbor_sram_addr src, uint32_t dir,
-                                          int32_t peerRank, NeighborSramOperand operand = {})
-{
-#if defined(PTO_GRID_SRAM_NATIVE_INTRINSIC)
-    (void)operand;
-    dst.value = __builtin_pto_get_neighbor_cbuf_addr(src.value, dir, peerRank);
-#else
-    neighbor_sram_addr remote{};
-    get_neighbor_sram_addr(remote, src, dir, peerRank, operand);
-    dst.value = remote.value;
-#endif
-}
-
-// Cross-core payload writes. Source address space names the producer core's
-// local storage; destination address register names the neighbor core storage.
-AICORE inline void copy_ubuf_to_neighbor_ubuf(neighbor_ubuf_addr dst, __ubuf__ void *src, uint32_t bytes,
+// Cross-core payload writes. Source and destination are SRAM address-register
+// values; the intrinsic name intentionally does not expose UB/CBUF variants.
+AICORE inline void copy_sram_to_neighbor_sram(neighbor_sram_addr dst, neighbor_sram_addr src, uint32_t bytes,
                                               uint64_t config)
 {
 #if defined(PTO_GRID_SRAM_NATIVE_INTRINSIC)
-    __builtin_pto_copy_ubuf_to_neighbor_ubuf(dst.value, src, bytes, config);
+    __builtin_pto_copy_sram_to_neighbor_sram(dst.value, src.value, bytes, config);
 #else
     // A2/A3 validation keeps the intrinsic call shape and only changes the
     // final lowering to a GM-backed fake window.
-    grid_sram_mock::MockCopyUbufToNeighborUbuf(dst, src, bytes, config);
+    grid_sram_mock::MockCopySramToNeighborSram(dst, src, bytes, config);
 #endif
 }
 
-AICORE inline void copy_ubuf_to_neighbor_cbuf(neighbor_cbuf_addr dst, __ubuf__ void *src, uint32_t bytes,
+// Cross-core payload read interface. The native lowering is intentionally left
+// as an interface placeholder until hardware/compiler support is available.
+AICORE inline void copy_neighbor_sram_to_sram(neighbor_sram_addr dst, neighbor_sram_addr src, uint32_t bytes,
                                               uint64_t config)
 {
 #if defined(PTO_GRID_SRAM_NATIVE_INTRINSIC)
-    __builtin_pto_copy_ubuf_to_neighbor_cbuf(dst.value, src, bytes, config);
+    (void)dst;
+    (void)src;
+    (void)bytes;
+    (void)config;
 #else
-    grid_sram_mock::MockCopyUbufToNeighborCbuf(dst, src, bytes, config);
-#endif
-}
-
-AICORE inline void copy_cbuf_to_neighbor_ubuf(neighbor_ubuf_addr dst, __cbuf__ void *src, uint32_t bytes,
-                                              uint64_t config)
-{
-#if defined(PTO_GRID_SRAM_NATIVE_INTRINSIC)
-    __builtin_pto_copy_cbuf_to_neighbor_ubuf(dst.value, src, bytes, config);
-#else
-    grid_sram_mock::MockCopyCbufToNeighborUbuf(dst, src, bytes, config);
-#endif
-}
-
-AICORE inline void copy_cbuf_to_neighbor_cbuf(neighbor_cbuf_addr dst, __cbuf__ void *src, uint32_t bytes,
-                                              uint64_t config)
-{
-#if defined(PTO_GRID_SRAM_NATIVE_INTRINSIC)
-    __builtin_pto_copy_cbuf_to_neighbor_cbuf(dst.value, src, bytes, config);
-#else
-    grid_sram_mock::MockCopyCbufToNeighborCbuf(dst, src, bytes, config);
-#endif
-}
-
-// A2/A3 mock helper for TPOP validation. Native Grid TPOP should bind the
-// local UB/L1 slot through TASSIGN instead of issuing a remote load.
-AICORE inline void copy_neighbor_ubuf_to_ubuf(__ubuf__ void *dst, neighbor_ubuf_addr src, uint32_t bytes,
-                                              uint64_t config)
-{
-#if defined(PTO_GRID_SRAM_NATIVE_INTRINSIC)
-    __builtin_pto_copy_neighbor_ubuf_to_ubuf(dst, src.value, bytes, config);
-#else
-    // Keep TPOP visible as intrinsic-style UB transfer in the A2/A3 mock.
-    grid_sram_mock::MockCopyNeighborUbufToUbuf(dst, src, bytes, config);
+    // Keep TPOP visible as intrinsic-style SRAM transfer in the A2/A3 mock.
+    grid_sram_mock::MockCopyNeighborSramToSram(dst, src, bytes, config);
 #endif
 }
 

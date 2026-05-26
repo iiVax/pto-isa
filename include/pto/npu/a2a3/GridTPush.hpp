@@ -12,7 +12,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //
 // Producer-side expansion uses:
 //   - wfe_neighbor_counter / mtspr_neighbor_counter for free/ready counters
-//   - get_neighbor_ubuf_addr         (resolve neighbor rank's Vector UB slot)
+//   - get_neighbor_sram_addr         (resolve neighbor rank's SRAM slot)
 //   - TSTORE / TLOAD                 (mock tile <-> fake-window movers)
 //
 // payload transfer (GRID_PAYLOAD_STORE_IMPL) is intentionally pluggable: the
@@ -38,13 +38,12 @@ namespace pto {
 namespace a2a3_grid_payload {
 
 template <typename TileT>
-__tf__ AICORE void CopyTileToNeighborUbufSlot(neighbor_ubuf_addr remoteSlot, TileT &tile, int slotBytes);
+__tf__ AICORE void CopyTileToNeighborSramSlot(neighbor_sram_addr remoteSlot, TileT &tile, int slotBytes);
 
 template <typename TileT>
-__tf__ AICORE void CopyNeighborUbufSlotToTile(TileT &tile, neighbor_ubuf_addr localSlot, int slotBytes);
+__tf__ AICORE void CopyNeighborSramSlotToTile(TileT &tile, neighbor_sram_addr localSlot, int slotBytes);
 
 AICORE neighbor_sram_addr LocalSramAddr(__gm__ uint8_t *localSlot);
-AICORE neighbor_ubuf_addr LocalUbufAddr(__gm__ uint8_t *localSlot);
 
 AICORE __gm__ uint32_t *RemoteCounterPtr(__gm__ void *runtimeCtx, __gm__ uint32_t *localCounter, int peerRank);
 
@@ -101,12 +100,12 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe &pipe, TileProd &tile, uint32_t maxSpins = 
     // Step 3: payload transfer to *neighbor's* SRAM slot region.
     //   LPU WSE: tmov [r_slot], tile_buf   (slot is neighbor-mapped)
     const int peerRank = NeighborRankForPush(Dir, pipe.coord, pipe.shape);
-    neighbor_ubuf_addr remoteUbufSlot{};
+    neighbor_sram_addr remoteSramSlot{};
     NeighborSramOperand sramOperand{pipe.runtimeCtx};
-    get_neighbor_ubuf_addr(remoteUbufSlot, localSramSlot, dirIdx, peerRank, sramOperand);
+    get_neighbor_sram_addr(remoteSramSlot, localSramSlot, dirIdx, peerRank, sramOperand);
     // Adapter keeps TPUSH independent of Tile internals; it immediately calls
-    // copy_ubuf_to_neighbor_ubuf(...) after extracting the tile's UB pointer.
-    a2a3_grid_payload::CopyTileToNeighborUbufSlot<TileProd>(remoteUbufSlot, tile, Pipe::SlotBytes);
+    // copy_sram_to_neighbor_sram(...) after extracting the tile's SRAM pointer.
+    a2a3_grid_payload::CopyTileToNeighborSramSlot<TileProd>(remoteSramSlot, tile, Pipe::SlotBytes);
 
     // Publish fence (D-5). Required between the slot TSTORE (MTE3, into peer
     // SRAM window via the mock address adapter) and the cross-rank ready flag

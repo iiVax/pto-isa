@@ -53,12 +53,12 @@ AICORE bool GRID_TRY_TPOP_IMPL(Pipe &pipe, TileCons &tile, uint32_t maxSpins = g
     const uint32_t idx = pipe.consIndex[dirIdx];
     const uint32_t slotOff = (idx % Pipe::SlotCount) * Pipe::SlotBytes;
     __gm__ uint8_t *localSlot = pipe.slotBase[dirIdx] + slotOff;
-    neighbor_ubuf_addr localUbufSlot = a2a3_grid_payload::LocalUbufAddr(localSlot);
+    neighbor_sram_addr localSramSlot = a2a3_grid_payload::LocalSramAddr(localSlot);
 
     // Step 3: payload transfer from local slot to consumer tile buffer.
     //   LPU WSE: tmov tile_buf, [r_slot]
-    // Adapter bridges Tile storage to copy_neighbor_ubuf_to_ubuf(...).
-    a2a3_grid_payload::CopyNeighborUbufSlotToTile<TileCons>(tile, localUbufSlot, Pipe::SlotBytes);
+    // Adapter bridges Tile storage to copy_neighbor_sram_to_sram(...).
+    a2a3_grid_payload::CopyNeighborSramSlotToTile<TileCons>(tile, localSramSlot, Pipe::SlotBytes);
 
     // Step 4: notify upstream producer that slot is free.
     //   LPU WSE: mtspr SPR_FREE_<DIR>, r_idx + 1

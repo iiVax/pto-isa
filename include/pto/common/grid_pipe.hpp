@@ -60,9 +60,10 @@ enum class GridDirection : uint8_t
     NORTH = 1,  // row -> row-1
     EAST = 2,   // col -> col+1
     WEST = 3,   // col -> col-1
+    SOUTH = 4,  // row -> row+1
 };
 
-inline constexpr int kGridDirectionCount = 4;
+inline constexpr int kGridDirectionCount = 5;
 
 AICORE constexpr int GridDirectionIndex(GridDirection d)
 {
@@ -147,6 +148,8 @@ AICORE constexpr bool CanPush(GridDirection dir, GridCoord c, GridShape s)
             return c.col + 1 < s.gridCols;
         case GridDirection::WEST:
             return c.col > 0;
+        case GridDirection::SOUTH:
+            return c.row + 1 < s.gridRows;
         case GridDirection::SOURCE:
             return false; // Never legal to push to SOURCE.
     }
@@ -162,6 +165,8 @@ AICORE constexpr bool CanPop(GridDirection dir, GridCoord c, GridShape s)
             return c.col > 0;
         case GridDirection::WEST:
             return c.col + 1 < s.gridCols;
+        case GridDirection::SOUTH:
+            return c.row > 0;
         case GridDirection::SOURCE:
             return true;
     }
@@ -177,6 +182,8 @@ AICORE constexpr GridCoord NeighborForPush(GridDirection dir, GridCoord c)
             return {c.row, c.col + 1};
         case GridDirection::WEST:
             return {c.row, c.col - 1};
+        case GridDirection::SOUTH:
+            return {c.row + 1, c.col};
         case GridDirection::SOURCE:
             return c; // Unused; static_assert blocks TPUSH<SOURCE>.
     }
@@ -192,6 +199,8 @@ AICORE constexpr GridCoord NeighborForPop(GridDirection dir, GridCoord c)
             return {c.row, c.col - 1};
         case GridDirection::WEST:
             return {c.row, c.col + 1};
+        case GridDirection::SOUTH:
+            return {c.row - 1, c.col};
         case GridDirection::SOURCE:
             return c; // Bound by runtime to source queue.
     }

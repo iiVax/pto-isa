@@ -88,11 +88,11 @@ include_directories(
 )
 
 # =============================================================================
-# 1. Mixed Cube/Vec Kernel.  Cube and Vec branches run concurrently and use
+# 1. ReduceSum split variant.  Cube and Vec branches run concurrently and use
 #    regular A2/A3 TPipe synchronization for intermediate FFN tiles.
 # =============================================================================
-add_library(distributed_ffn_grid_mixed_kernel SHARED distributed_ffn_grid_compute_kernel.cpp)
-target_compile_options(distributed_ffn_grid_mixed_kernel PRIVATE
+add_library(distributed_ffn_grid_reducesum_mixed_kernel SHARED distributed_ffn_grid_reducesum_compute_kernel.cpp)
+target_compile_options(distributed_ffn_grid_reducesum_mixed_kernel PRIVATE
     ${CMAKE_CCE_COMPILE_OPTIONS}
     --cce-aicore-arch=dav-c220
     -DMEMORY_BASE -std=c++17
@@ -100,7 +100,7 @@ target_compile_options(distributed_ffn_grid_mixed_kernel PRIVATE
     -DCONFIG_TOKEN_TILE=${TOKEN_TILE} -DCONFIG_MODEL_TILE=${MODEL_TILE}
     -DCONFIG_FFN_TILE=${FFN_TILE}
 )
-target_include_directories(distributed_ffn_grid_mixed_kernel PRIVATE
+target_include_directories(distributed_ffn_grid_reducesum_mixed_kernel PRIVATE
     ${PROJECT_SOURCE_DIR}/../../../../include/
     ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
     $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc
@@ -112,16 +112,44 @@ target_include_directories(distributed_ffn_grid_mixed_kernel PRIVATE
     $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/interface
     $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/utils
 )
-target_link_directories(distributed_ffn_grid_mixed_kernel PRIVATE ${ASCEND_HOME_PATH}/lib64)
-target_link_libraries(distributed_ffn_grid_mixed_kernel PRIVATE hcomm runtime nnopbase)
-target_link_options(distributed_ffn_grid_mixed_kernel PRIVATE --cce-fatobj-link)
+target_link_directories(distributed_ffn_grid_reducesum_mixed_kernel PRIVATE ${ASCEND_HOME_PATH}/lib64)
+target_link_libraries(distributed_ffn_grid_reducesum_mixed_kernel PRIVATE hcomm runtime nnopbase)
+target_link_options(distributed_ffn_grid_reducesum_mixed_kernel PRIVATE --cce-fatobj-link)
+
+# AllGather split variant: hidden shards are gathered through GridPipe, and
+# down projection writes one output-H shard per column.
+add_library(distributed_ffn_grid_allgather_mixed_kernel SHARED distributed_ffn_grid_allgather_compute_kernel.cpp)
+target_compile_options(distributed_ffn_grid_allgather_mixed_kernel PRIVATE
+    ${CMAKE_CCE_COMPILE_OPTIONS}
+    --cce-aicore-arch=dav-c220
+    -DMEMORY_BASE -std=c++17
+    -DCONFIG_FFN_GRID_ALLGATHER
+    -DCONFIG_GRID_ROWS=${GRID_ROWS} -DCONFIG_GRID_COLS=${GRID_COLS}
+    -DCONFIG_TOKEN_TILE=${TOKEN_TILE} -DCONFIG_MODEL_TILE=${MODEL_TILE}
+    -DCONFIG_FFN_TILE=${FFN_TILE}
+)
+target_include_directories(distributed_ffn_grid_allgather_mixed_kernel PRIVATE
+    ${PROJECT_SOURCE_DIR}/../../../../include/
+    ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/ascendc/include/basic_api
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include/ascendc/basic_api
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/impl/basic_api
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/ascendc/include/basic_api/impl
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/interface
+    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/utils
+)
+target_link_directories(distributed_ffn_grid_allgather_mixed_kernel PRIVATE ${ASCEND_HOME_PATH}/lib64)
+target_link_libraries(distributed_ffn_grid_allgather_mixed_kernel PRIVATE hcomm runtime nnopbase)
+target_link_options(distributed_ffn_grid_allgather_mixed_kernel PRIVATE --cce-fatobj-link)
 
 # =============================================================================
 # 2. Host driver executable
 # =============================================================================
-add_executable(distributed_ffn_grid main.cpp)
-target_compile_options(distributed_ffn_grid PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS})
-target_include_directories(distributed_ffn_grid PRIVATE
+add_executable(distributed_ffn_grid_reducesum main_reducesum.cpp)
+target_compile_options(distributed_ffn_grid_reducesum PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS})
+target_include_directories(distributed_ffn_grid_reducesum PRIVATE
     ${PROJECT_SOURCE_DIR}/../../../../include/
     ${PROJECT_SOURCE_DIR}/../../../../tests/common
     ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
@@ -132,20 +160,53 @@ target_include_directories(distributed_ffn_grid PRIVATE
     ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
     ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/profiling
 )
-target_compile_definitions(distributed_ffn_grid PRIVATE
+target_compile_definitions(distributed_ffn_grid_reducesum PRIVATE
     CONFIG_GRID_ROWS=${GRID_ROWS} CONFIG_GRID_COLS=${GRID_COLS}
     CONFIG_TOKEN_TILE=${TOKEN_TILE} CONFIG_MODEL_TILE=${MODEL_TILE}
     CONFIG_FFN_TILE=${FFN_TILE}
 )
 
-target_link_directories(distributed_ffn_grid PUBLIC
+target_link_directories(distributed_ffn_grid_reducesum PUBLIC
     ${ASCEND_HOME_PATH}/lib64
     ${ASCEND_HOME_PATH}/simulator/${SOC_VERSION}/lib
     ${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib
 )
 
-target_link_libraries(distributed_ffn_grid PRIVATE
-    distributed_ffn_grid_mixed_kernel
+target_link_libraries(distributed_ffn_grid_reducesum PRIVATE
+    distributed_ffn_grid_reducesum_mixed_kernel
+    $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},sim>:runtime_camodel>>
+    $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},npu>:runtime>>
+    stdc++ ascendcl hcomm m tiling_api platform c_sec dl nnopbase pthread
+)
+
+add_executable(distributed_ffn_grid_allgather main_allgather.cpp)
+target_compile_options(distributed_ffn_grid_allgather PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS})
+target_include_directories(distributed_ffn_grid_allgather PRIVATE
+    ${PROJECT_SOURCE_DIR}/../../../../include/
+    ${PROJECT_SOURCE_DIR}/../../../../tests/common
+    ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
+    ${ASCEND_HOME_PATH}/pkg_inc/runtime
+    ${ASCEND_HOME_PATH}/pkg_inc/toolchain
+    ${ASCEND_HOME_PATH}/pkg_inc/profiling
+    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/runtime
+    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
+    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/profiling
+)
+target_compile_definitions(distributed_ffn_grid_allgather PRIVATE
+    CONFIG_FFN_GRID_ALLGATHER
+    CONFIG_GRID_ROWS=${GRID_ROWS} CONFIG_GRID_COLS=${GRID_COLS}
+    CONFIG_TOKEN_TILE=${TOKEN_TILE} CONFIG_MODEL_TILE=${MODEL_TILE}
+    CONFIG_FFN_TILE=${FFN_TILE}
+)
+
+target_link_directories(distributed_ffn_grid_allgather PUBLIC
+    ${ASCEND_HOME_PATH}/lib64
+    ${ASCEND_HOME_PATH}/simulator/${SOC_VERSION}/lib
+    ${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib
+)
+
+target_link_libraries(distributed_ffn_grid_allgather PRIVATE
+    distributed_ffn_grid_allgather_mixed_kernel
     $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},sim>:runtime_camodel>>
     $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},npu>:runtime>>
     stdc++ ascendcl hcomm m tiling_api platform c_sec dl nnopbase pthread

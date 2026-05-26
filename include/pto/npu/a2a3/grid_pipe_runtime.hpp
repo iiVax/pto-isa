@@ -26,15 +26,17 @@ namespace a2a3_grid {
 //
 //   offset                                         contents
 //   ----------------------------------------------------------------------
-//   0                                              ready flags [4 dirs] u32
-//   16                                             free  flags [4 dirs] u32
-//   32                                             reserved (alignment, telemetry)
-//   kSlotRegionOffset                              slot region for all 4 dirs
+//   0                                              ready flags [kGridDirectionCount] u32
+//   4 * kGridDirectionCount                        free flags [kGridDirectionCount] u32
+//   8 * kGridDirectionCount                        reserved (fault sentinels, alignment, telemetry)
+//   kSlotRegionOffset                              slot region for all directions
 //     + dir * SlotCount * SlotBytes                slot ring for that direction
 //
 // The slot region is sized to (kGridDirectionCount * SlotCount * SlotBytes).
-// Aligned to 512 bytes for A2/A3 GM access requirements.
-inline constexpr uint32_t kFlagsBytes = 64; // 4 ready + 4 free + reserved
+// Keep enough reserved words for GridTPush/GridTPop fault sentinels:
+//   readyFlags[dir] + kFaultFlagWordOffset
+//   freeFlags[dir]  + kFaultFlagWordOffset
+inline constexpr uint32_t kFlagsBytes = 128;
 inline constexpr uint32_t kSlotRegionOffset = kFlagsBytes;
 
 inline constexpr uint32_t kReadyFlagOffset(GridDirection d)
@@ -44,7 +46,7 @@ inline constexpr uint32_t kReadyFlagOffset(GridDirection d)
 
 inline constexpr uint32_t kFreeFlagOffset(GridDirection d)
 {
-    return 4 * sizeof(uint32_t) + static_cast<uint32_t>(d) * sizeof(uint32_t);
+    return kGridDirectionCount * sizeof(uint32_t) + static_cast<uint32_t>(d) * sizeof(uint32_t);
 }
 
 template <int SlotBytes, int SlotCount>
@@ -81,7 +83,7 @@ AICORE inline void InitGridPipeFromWindow(Pipe &pipe, GridShape shape, GridCoord
     __gm__ uint32_t *flags = reinterpret_cast<__gm__ uint32_t *>(window);
     for (int i = 0; i < kGridDirectionCount; ++i) {
         pipe.readyFlags[i] = flags + i;
-        pipe.freeFlags[i] = flags + 4 + i;
+        pipe.freeFlags[i] = flags + kGridDirectionCount + i;
         pipe.slotBase[i] = window + kSlotRegionOffset + i * Pipe::SlotCount * Pipe::SlotBytes;
         pipe.prodIndex[i] = 0;
         pipe.consIndex[i] = 0;

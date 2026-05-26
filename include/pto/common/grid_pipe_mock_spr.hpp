@@ -42,7 +42,7 @@ namespace grid_mock {
 #endif
 
 inline constexpr uint32_t kDefaultWfeMaxSpins = PTO_GRID_MOCK_WFE_MAX_SPINS;
-inline constexpr uint32_t kFaultFlagWordOffset = 8;
+inline constexpr uint32_t kFaultFlagWordOffset = 2 * kGridDirectionCount;
 
 // MOCK: design doc 5.3 producer step (4), consumer step (4).
 //
@@ -189,10 +189,12 @@ inline AICORE void MockBoundaryFault(__gm__ uint32_t *faultSentinel, uint32_t fa
 inline constexpr uint32_t kFaultPushNorth = 0x101;
 inline constexpr uint32_t kFaultPushEast = 0x102;
 inline constexpr uint32_t kFaultPushWest = 0x103;
-inline constexpr uint32_t kFaultPushSource = 0x104; // Always illegal.
+inline constexpr uint32_t kFaultPushSouth = 0x104;
+inline constexpr uint32_t kFaultPushSource = 0x105; // Always illegal.
 inline constexpr uint32_t kFaultPopNorth = 0x201;
 inline constexpr uint32_t kFaultPopEast = 0x202;
 inline constexpr uint32_t kFaultPopWest = 0x203;
+inline constexpr uint32_t kFaultPopSouth = 0x204;
 inline constexpr uint32_t kFaultWaitReadyTimeout = 0x301;
 inline constexpr uint32_t kFaultWaitFreeTimeout = 0x302;
 
@@ -208,6 +210,8 @@ AICORE constexpr uint32_t PushFaultCode(GridDirection dir)
             return kFaultPushEast;
         case GridDirection::WEST:
             return kFaultPushWest;
+        case GridDirection::SOUTH:
+            return kFaultPushSouth;
         case GridDirection::SOURCE:
             return kFaultPushSource;
     }
@@ -223,6 +227,8 @@ AICORE constexpr uint32_t PopFaultCode(GridDirection dir)
             return kFaultPopEast;
         case GridDirection::WEST:
             return kFaultPopWest;
+        case GridDirection::SOUTH:
+            return kFaultPopSouth;
         case GridDirection::SOURCE:
             return 0; // SOURCE pop is legal; never raises a boundary fault.
     }

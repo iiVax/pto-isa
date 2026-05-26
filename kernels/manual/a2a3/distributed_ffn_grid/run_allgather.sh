@@ -9,9 +9,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # --------------------------------------------------------------------------------
 
-# Single-device multi-block FFN GridPipe demo.  grid-rows x grid-cols is the
-# logical grid launched on one NPU.  Columns are model-parallel FFN shards and
-# reduce through the same-device GridPipe EAST mock.
+# Single-device multi-block FFN GridPipe AllGather demo.  grid-rows x
+# grid-cols is the logical grid launched on one NPU.  Columns are
+# model-parallel FFN shards; hidden shards are AllGathered before down, and
+# down writes output-H shards directly.
 
 : "${ASCEND_CANN_PATH:=$(ls -1d /usr/local/Ascend/cann-*/set_env.sh 2>/dev/null | sort -V | tail -1)}"
 if [ -z "${ASCEND_CANN_PATH}" ]; then
@@ -57,6 +58,10 @@ if [ "${N_RANKS}" -ne 1 ]; then
     echo "[ERROR] Single-device multi-block mode requires -n/--n-ranks 1."
     exit 1
 fi
+if [ $((MODEL_TILE % GRID_COLS)) -ne 0 ]; then
+    echo "[ERROR] AllGather mode requires --model-tile divisible by --grid-cols."
+    exit 1
+fi
 
 if [[ ! "${SOC_VERSION}" =~ ^Ascend ]]; then
     echo "[ERROR] Unsupported SocVersion: ${SOC_VERSION}"
@@ -70,7 +75,7 @@ fi
 rm -rf /dev/shm/sem.hccl* 2>/dev/null
 ipcrm -a 2>/dev/null
 
-echo "=== Single-device Multi-block FFN GridPipe Demo ==="
+echo "=== Single-device Multi-block FFN GridPipe AllGather Demo ==="
 echo "  RUN_MODE: ${RUN_MODE}  SOC_VERSION: ${SOC_VERSION}"
 echo "  Grid: ${GRID_ROWS}x${GRID_COLS}  N_RANKS: ${N_RANKS}  DEVICE_ID: ${DEVICE_ID}"
 echo "  Tile: ${TOKEN_TILE}x${MODEL_TILE}  FfnTile: ${FFN_TILE}"
@@ -85,6 +90,7 @@ if [ "${BUILD_ONLY}" -eq 0 ]; then
     python3 "${SCRIPT_DIR}/scripts/gen_data.py" \
         --grid-rows "${GRID_ROWS}" --grid-cols "${GRID_COLS}" \
         --t "${TOKEN_TILE}" --h "${MODEL_TILE}" --fi "${FFN_TILE}" \
+        --split-mode allgather \
         --output-dir "${SCRIPT_DIR}/out"
 fi
 
@@ -99,7 +105,7 @@ cmake -DRUN_MODE=${RUN_MODE} -DSOC_VERSION=${SOC_VERSION} \
       -DGRID_ROWS=${GRID_ROWS} -DGRID_COLS=${GRID_COLS} \
       -DTOKEN_TILE=${TOKEN_TILE} -DMODEL_TILE=${MODEL_TILE} -DFFN_TILE=${FFN_TILE} \
       ..
-make -j16
+make -j16 distributed_ffn_grid_allgather
 
 if [ "${BUILD_ONLY}" -eq 1 ]; then
     echo "[INFO] --build-only requested; skipping run."
@@ -107,7 +113,7 @@ if [ "${BUILD_ONLY}" -eq 1 ]; then
 fi
 
 echo ""
-echo "=== Running Single-device Multi-block FFN GridPipe ==="
+echo "=== Running Single-device Multi-block FFN GridPipe AllGather ==="
 export N_RANKS=${N_RANKS}
 export FFN_GRID_DATA_DIR="${SCRIPT_DIR}/out"
-./distributed_ffn_grid --device-id "${DEVICE_ID}"
+./distributed_ffn_grid_allgather --device-id "${DEVICE_ID}"

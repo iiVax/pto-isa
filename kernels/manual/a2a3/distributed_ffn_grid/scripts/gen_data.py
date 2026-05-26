@@ -66,6 +66,7 @@ class FfnDataConfig:
     fi: int          # per-rank intermediate dim per col (== FFN_FFN_TILE)
     grid_rows: int
     grid_cols: int
+    split_mode: str = "reduce"
     output_dir: str = "./out"
 
 
@@ -76,9 +77,13 @@ def _prelu(x: np.ndarray, alpha: float = PRELU_ALPHA) -> np.ndarray:
 def gen_data(cfg: FfnDataConfig) -> None:
     t, h, fi = cfg.t, cfg.h, cfg.fi
     grid_rows, grid_cols = cfg.grid_rows, cfg.grid_cols
+    split_mode = cfg.split_mode
     n_ranks = grid_rows * grid_cols
     t_total = t * grid_rows
     f_total = fi * grid_cols
+    if split_mode == "allgather" and h % grid_cols != 0:
+        raise ValueError(f"allgather split requires h ({h}) divisible by grid_cols ({grid_cols})")
+    h_per_col = h // grid_cols
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     src_type = np.float16
@@ -91,14 +96,15 @@ def gen_data(cfg: FfnDataConfig) -> None:
     w_up_full   = np.random.randint(0, 2, [h, f_total]).astype(src_type)
     w_down_full = np.random.randint(0, 2, [f_total, h]).astype(src_type)
 
-    # Reference computation in fp32.  Down-cast inputs to fp32 for the math
-    # but persist weights in fp16 (kernel side TLOADs fp16 -> mixed-precision
-    # matmul).
+    # Reference computation follows the kernel pipeline: gate/up matmuls
+    # accumulate in fp32, activation is rounded to fp16 hidden, and down
+    # matmul accumulates fp32 from that rounded hidden.
     x_f32 = x_full.astype(dst_type)
     gate_full = x_f32 @ w_gate_full.astype(dst_type)
     up_full   = x_f32 @ w_up_full.astype(dst_type)
     act_full  = _prelu(gate_full * up_full, PRELU_ALPHA)
-    golden    = (act_full @ w_down_full.astype(dst_type)).astype(dst_type)
+    hidden_full = act_full.astype(src_type).astype(dst_type)
+    golden    = (hidden_full @ w_down_full.astype(dst_type)).astype(dst_type)
 
     for row in range(grid_rows):
         t_start = row * t
@@ -109,6 +115,8 @@ def gen_data(cfg: FfnDataConfig) -> None:
             rank = row * grid_cols + col
             fi_start = col * fi
             fi_end = fi_start + fi
+            h_start = col * h_per_col
+            h_end = h_start + h_per_col
 
             x_path       = os.path.join(cfg.output_dir, f"pe_{rank}_x.bin")
             w_gate_path  = os.path.join(cfg.output_dir, f"pe_{rank}_w_gate.bin")
@@ -119,20 +127,24 @@ def gen_data(cfg: FfnDataConfig) -> None:
             x_row.tofile(x_path)
             w_gate_full[:, fi_start:fi_end].astype(src_type).tofile(w_gate_path)
             w_up_full[:, fi_start:fi_end].astype(src_type).tofile(w_up_path)
-            w_down_full[fi_start:fi_end, :].astype(src_type).tofile(w_down_path)
+            if split_mode == "allgather":
+                w_down = w_down_full[:, h_start:h_end]
+            else:
+                w_down = w_down_full[fi_start:fi_end, :]
+            w_down.astype(src_type).tofile(w_down_path)
 
             label = "block" if grid_cols == 1 else "rank"
             print(f"  - {label}{rank} (row={row},col={col}): x{tuple(x_row.shape)} -> {x_path}")
             print(f"             w_gate[{h},{fi}] -> {w_gate_path}")
             print(f"             w_up[{h},{fi}]   -> {w_up_path}")
-            print(f"             w_down[{fi},{h}] -> {w_down_path}")
+            print(f"             w_down{tuple(w_down.shape)} -> {w_down_path}")
 
     golden_path = os.path.join(cfg.output_dir, "golden.bin")
     golden.tofile(golden_path)
     print(f"  - golden{tuple(golden.shape)} fp32 -> {golden_path}")
     print(
         f"[INFO] Generated FFN data: T={t} (T_total={t_total}) H={h} Fi={fi} (F_total={f_total}) "
-        f"grid={grid_rows}x{grid_cols} n_ranks={n_ranks}"
+        f"grid={grid_rows}x{grid_cols} n_ranks={n_ranks} split_mode={split_mode}"
     )
     print(f"[INFO] alpha={PRELU_ALPHA} (must match kernel TLRELU constant FFN_PRELU_ALPHA)")
 
@@ -148,6 +160,8 @@ def main() -> None:
     parser.add_argument("--t", type=int, required=True, help="Token count per row (T)")
     parser.add_argument("--h", type=int, required=True, help="Hidden dim (H)")
     parser.add_argument("--fi", type=int, required=True, help="Per-rank intermediate dim per col (Fi)")
+    parser.add_argument("--split-mode", choices=("reduce", "allgather"), default="reduce",
+                        help="W_down sharding mode: reduce keeps [Fi,H], allgather keeps [F,Hc]")
     parser.add_argument("--output-dir", type=str, default="./out", help="Output directory")
 
     args = parser.parse_args()
@@ -166,6 +180,7 @@ def main() -> None:
         fi=args.fi,
         grid_rows=grid_rows,
         grid_cols=grid_cols,
+        split_mode=args.split_mode,
         output_dir=args.output_dir,
     )
     gen_data(cfg)
