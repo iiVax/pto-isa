@@ -156,23 +156,48 @@ public:
         }
     }
 
+    // Number of DType elements a tile addresses from its base.
+    //
+    // A windowed sub-view keeps the full static block shape (Rows x Cols, hence
+    // Numel) but marks only ValidRow x ValidCol valid and may sit at a non-zero
+    // byte offset. The tile addresses memory up to its last valid element, so the
+    // count is the valid-region footprint: equal to Numel for a fully-valid tile,
+    // smaller for a sub-window. Returns Numel when the valid shape is dynamic (not
+    // visible at this static call site) or the layout is unsupported below.
+    template <typename TileDef>
+    static std::size_t TileAccessElems()
+    {
+        // GetTileOffset is defined for non-boxed tiles and the Nz/Zn/Zz boxed
+        // fractal layouts only.
+        constexpr bool layoutSupported = !TileDef::isBoxedLayout || is_Nz_layout<TileDef>::value ||
+                                         is_Zn_layout<TileDef>::value || is_Zz_layout<TileDef>::value;
+        if constexpr (layoutSupported && (TileDef::ValidRow > 0) && (TileDef::ValidCol > 0)) {
+            // Every supported layout maps the valid region's far corner to its
+            // largest element offset, so that offset + 1 is the element count.
+            return GetTileOffset<TileDef>(TileDef::ValidRow - 1, TileDef::ValidCol - 1) + 1;
+        } else {
+            return static_cast<std::size_t>(TileDef::Numel);
+        }
+    }
+
     // Get pointer to memory at offset within a region
     template <typename TileDef>
     TileDef::DType *GetPointer(std::size_t byteOffset)
     {
         static_assert(is_tile_data_v<TileDef>);
 
+        const std::size_t accessElems = TileAccessElems<TileDef>();
         if constexpr (TileDef::Loc == TileType::Mat) {
-            return GetPointer<typename TileDef::DType, MemoryRegion::L1>(byteOffset, TileDef::Numel);
+            return GetPointer<typename TileDef::DType, MemoryRegion::L1>(byteOffset, accessElems);
         } else if constexpr (TileDef::Loc == TileType::Left) {
-            return GetPointer<typename TileDef::DType, MemoryRegion::L0A>(byteOffset, TileDef::Numel);
+            return GetPointer<typename TileDef::DType, MemoryRegion::L0A>(byteOffset, accessElems);
         } else if constexpr (TileDef::Loc == TileType::Right) {
-            return GetPointer<typename TileDef::DType, MemoryRegion::L0B>(byteOffset, TileDef::Numel);
+            return GetPointer<typename TileDef::DType, MemoryRegion::L0B>(byteOffset, accessElems);
         } else if constexpr (TileDef::Loc == TileType::Acc) {
-            return GetPointer<typename TileDef::DType, MemoryRegion::L0C>(byteOffset, TileDef::Numel);
+            return GetPointer<typename TileDef::DType, MemoryRegion::L0C>(byteOffset, accessElems);
         } else {
             return GetPointer<typename TileDef::DType, MemoryRegion::UB>(byteOffset,
-                                                                         TileDef::Numel); // For Vec and unknown types
+                                                                         accessElems); // For Vec and unknown types
         }
     }
 
