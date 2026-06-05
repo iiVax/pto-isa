@@ -183,6 +183,59 @@ void runSplitWraparound()
         EXPECT_TRUE(ResultCmp(expected, actual[iter], 0));
     }
 }
+
+// Same depth-2-in-flight pop pattern, but on a DIR_BOTH pipe. A bidirectional pipe
+// carries V2C (vector->cube) and C2V (cube->vector) traffic on one ring, so the
+// cube's V2C consumer is NOT "is_v2c && !is_c2v" and, before the fix, fell back to
+// a naive consumer that did not advance the slot cursor per pop -- two outstanding
+// pops then aliased the same slot and the two frees corrupted the ring accounting.
+// This is the hc_head linear-kernel deadlock in miniature (cube finishes, both
+// vector lanes hang at TPOP). The fix routes DIR_BOTH V2C consumers through the
+// pending-slot FIFO just like the pure-V2C path, so the pops read distinct slots.
+template <typename T, int rows, int cols, TileSplitAxis Split>
+void runSplitWraparoundBothDir()
+{
+    constexpr int kFifoDepth = 4;
+    constexpr int kIterations = 6;
+    using MatTile = Tile<TileType::Mat, T, rows, cols>;
+    using Pipe = TPipe<kPipeFlagId + 2, Direction::DIR_BOTH, sizeof(T) * MatTile::Numel, kFifoDepth, kFifoDepth, false>;
+
+    NPU_MEMORY_CLEAR();
+    Pipe::reset_for_cpu_sim();
+    Pipe pipe((__gm__ void *)nullptr, 0x0, kMatConsumerBase);
+
+    std::vector<std::vector<T>> actual(kIterations);
+
+    auto pushBoth = [&](int iter) {
+        pushLane<T, rows, cols, Split>(pipe, iter, 0);
+        pushLane<T, rows, cols, Split>(pipe, iter, 1);
+    };
+
+    for (int iter = 0; iter < std::min(kFifoDepth, kIterations); ++iter) {
+        pushBoth(iter);
+    }
+    popOnly<T, rows, cols, Split>(pipe, actual[0]); // first tile in flight
+    for (int iter = 0; iter < kIterations; ++iter) {
+        const int nextIter = iter + 1;
+        if (nextIter < kIterations) {
+            popOnly<T, rows, cols, Split>(pipe, actual[nextIter]); // 2 in flight
+        }
+        freeOne<Split>(pipe);                                      // retire tile `iter`
+        const int producerIter = iter + kFifoDepth;
+        if (producerIter < kIterations) {
+            pushBoth(producerIter);
+        }
+    }
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+        const auto expected = makeExpected<T, rows, cols, Split>(iter);
+        EXPECT_TRUE(ResultCmp(expected, actual[iter], 0));
+    }
+
+    auto &sharedState = Pipe::GetSharedState();
+    std::lock_guard<std::mutex> lock(sharedState.mutex);
+    EXPECT_EQ(sharedState.occupied, 0);
+}
 } // namespace
 
 class TPushPopVCSplitTest : public testing::Test {
@@ -218,4 +271,14 @@ TEST_F(TPushPopVCSplitTest, left_right_single_tile_float_16x32)
 TEST_F(TPushPopVCSplitTest, left_right_fifo_wraparound_float_16x32)
 {
     runSplitWraparound<float, 16, 32, TileSplitAxis::TILE_LEFT_RIGHT>();
+}
+
+TEST_F(TPushPopVCSplitTest, both_dir_up_down_overlapping_pops_read_distinct_slots_float_16x32)
+{
+    runSplitWraparoundBothDir<float, 16, 32, TileSplitAxis::TILE_UP_DOWN>();
+}
+
+TEST_F(TPushPopVCSplitTest, both_dir_left_right_overlapping_pops_read_distinct_slots_float_16x32)
+{
+    runSplitWraparoundBothDir<float, 16, 32, TileSplitAxis::TILE_LEFT_RIGHT>();
 }
