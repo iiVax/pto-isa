@@ -434,6 +434,11 @@ struct TPipe {
         std::array<uint32_t, SlotNum> consumers_claimed{};
         std::array<uint32_t, SlotNum> producers_allocated{};
         std::array<uint32_t, SlotNum> producers_done{};
+        // Per-slot reserved flag: set when a producer claims the slot (allocate),
+        // cleared when the slot is fully consumed (free). Lets allocate() gate on
+        // the specific cursor slot being free, which keeps DIR_BOTH / two-lane C2V
+        // traffic correct when slots are released out of producer order.
+        std::array<int, SlotNum> slot_busy{};
     };
 
     struct SharedStateStorage {
@@ -510,6 +515,7 @@ struct TPipe {
         shared_state.consumers_claimed.fill(0);
         shared_state.producers_allocated.fill(0);
         shared_state.producers_done.fill(0);
+        shared_state.slot_busy.fill(0);
         shared_state.transfer_dirs.fill(cpu_pipe::TransferDir::None);
         shared_state.cv.notify_all();
     }
@@ -582,12 +588,23 @@ struct TPipe {
                 });
                 tileIndex = shared_state.next_producer_slot;
                 shared_state.producers_allocated[static_cast<std::size_t>(tileIndex % RingFiFo::SLOT_NUM)] |= laneMask;
+                shared_state.slot_busy[static_cast<std::size_t>(tileIndex % RingFiFo::SLOT_NUM)] = 1;
                 subTileIndex = static_cast<int>(laneId);
                 return;
             } else {
-                shared_state.cv.wait(lock, [&shared_state]() { return shared_state.occupied < RingFiFo::SLOT_NUM; });
+                // Claim the slot at next_producer_slot only once it is actually free:
+                // unused (slot_busy clear, no pending transfer) and the ring has room.
+                // With DIR_BOTH or two-lane C2V, slots are released out of production
+                // order, so the cursor slot may still hold unconsumed data even while
+                // other slots are free.
+                shared_state.cv.wait(lock, [&shared_state]() {
+                    const auto slot = static_cast<std::size_t>(shared_state.next_producer_slot);
+                    return shared_state.occupied < RingFiFo::SLOT_NUM && shared_state.slot_busy[slot] == 0 &&
+                           shared_state.transfer_dirs[slot] == cpu_pipe::TransferDir::None;
+                });
             }
             tileIndex = shared_state.next_producer_slot;
+            shared_state.slot_busy[static_cast<std::size_t>(tileIndex % RingFiFo::SLOT_NUM)] = 1;
             subTileIndex = static_cast<int>(get_subblockid());
         }
 
@@ -784,6 +801,7 @@ struct TPipe {
                     remaining = 0;
                     shared_state.consumers_claimed[slotIndex] = 0;
                     shared_state.transfer_dirs[slotIndex] = cpu_pipe::TransferDir::None;
+                    shared_state.slot_busy[slotIndex] = 0;
                     // Only c2v split advances the consumer cursor here (V2C does it in wait()).
                     if constexpr (Split != TileSplitAxis::TILE_NO_SPLIT && !(TPipe::is_v2c && !TPipe::is_c2v)) {
                         shared_state.next_consumer_slot = (freeTileIndex + 1) % RingFiFo::SLOT_NUM;

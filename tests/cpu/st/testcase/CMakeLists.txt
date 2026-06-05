@@ -46,7 +46,7 @@ tadd
 taddc
 tadds
 taddsc
-tassign_alias
+tassign
 tand
 tands
 targreduceop
