@@ -645,6 +645,11 @@ struct TPipe {
         bool isWait = true;
         bool isFree = true;
         int entryOffset = 0;
+        // CPU-sim only: set by wait() when this pop is serviced through the pending-slot
+        // FIFO (overlapping pops kept on distinct slots). free() reads it to choose the
+        // matching release path on a DIR_BOTH pipe, where the Split-only template cannot
+        // tell a V2C-direction release (cube popping Mat) from a C2V one (vector popping Vec).
+        bool pendingSlotTracked = false;
 
         PTO_INTERNAL Consumer() = default;
 
@@ -695,7 +700,9 @@ struct TPipe {
             (void)Split;
             auto &shared_state = TPipe::GetSharedState();
             std::unique_lock<std::mutex> lock(shared_state.mutex);
+            pendingSlotTracked = false;
             constexpr auto expectedDir = cpu_pipe::GetConsumerTransferDir<TPipe, TileCons>();
+            constexpr bool kBothDir = TPipe::is_c2v && TPipe::is_v2c;
             if constexpr (TPipe::is_c2v && cpu_pipe::IsC2VConsumerTile<TileCons>() &&
                           Split != TileSplitAxis::TILE_NO_SPLIT) {
                 const uint32_t laneId = cpu_pipe::GetSplitLaneId<Split>();
@@ -715,7 +722,8 @@ struct TPipe {
             // A pure V2C consumer (the cube) pops one full combined tile regardless of how the
             // producers split it, so it uses the same pending-slot tracking as no-split mode to
             // keep overlapping pops on distinct slots when the ring is reused.
-            if constexpr (Split == TileSplitAxis::TILE_NO_SPLIT || (TPipe::is_v2c && !TPipe::is_c2v)) {
+            if constexpr (Split == TileSplitAxis::TILE_NO_SPLIT || (TPipe::is_v2c && !TPipe::is_c2v) ||
+                          (kBothDir && expectedDir == cpu_pipe::TransferDir::V2C)) {
                 if constexpr (cpu_pipe::ShouldNoSplitC2VConsumerLaneParticipate<TPipe, TileCons, Split>()) {
                     const uint32_t laneId = cpu_pipe::GetSplitLaneId<TileSplitAxis::TILE_UP_DOWN>();
                     const uint32_t laneMask = cpu_pipe::GetSplitLaneMask<TileSplitAxis::TILE_UP_DOWN>(laneId);
@@ -755,6 +763,7 @@ struct TPipe {
                 subTileIndex = static_cast<int>(get_subblockid());
                 shared_state.next_consumer_slot = (tileIndex + 1) % RingFiFo::SLOT_NUM;
                 cpu_pipe::PushPendingSlot(shared_state.popped_slots, shared_state.popped_not_freed, tileIndex);
+                pendingSlotTracked = true;
                 return;
             }
             shared_state.cv.wait(lock, [&shared_state, expectedDir]() {
@@ -774,6 +783,7 @@ struct TPipe {
             {
                 std::lock_guard<std::mutex> lock(shared_state.mutex);
                 int freeTileIndex = tileIndex;
+                constexpr bool kBothDir = TPipe::is_c2v && TPipe::is_v2c;
                 // A pure V2C consumer uses pending-slot tracking in split mode too.
                 if constexpr (Split == TileSplitAxis::TILE_NO_SPLIT || (TPipe::is_v2c && !TPipe::is_c2v)) {
                     if constexpr (cpu_pipe::ShouldNoSplitC2VConsumerLaneFree<TPipe, Split>()) {
@@ -792,6 +802,17 @@ struct TPipe {
                             return;
                         }
                     }
+                } else if constexpr (kBothDir) {
+                    // DIR_BOTH split: the V2C consumer (cube popping Mat) tracked overlapping
+                    // pops through the pending FIFO in wait(); release the oldest such slot here
+                    // so back-to-back pops free distinct slots. The C2V split consumer (vector
+                    // popping Vec) is not pending-tracked and falls through to the lane logic.
+                    if (pendingSlotTracked) {
+                        if (!cpu_pipe::PopPendingSlot(shared_state.popped_slots, shared_state.popped_not_freed,
+                                                      freeTileIndex)) {
+                            return;
+                        }
+                    }
                 }
                 const auto slotIndex = static_cast<std::size_t>(freeTileIndex % RingFiFo::SLOT_NUM);
                 auto &remaining = shared_state.remaining_consumers[slotIndex];
@@ -802,8 +823,17 @@ struct TPipe {
                     shared_state.consumers_claimed[slotIndex] = 0;
                     shared_state.transfer_dirs[slotIndex] = cpu_pipe::TransferDir::None;
                     shared_state.slot_busy[slotIndex] = 0;
-                    // Only c2v split advances the consumer cursor here (V2C does it in wait()).
-                    if constexpr (Split != TileSplitAxis::TILE_NO_SPLIT && !(TPipe::is_v2c && !TPipe::is_c2v)) {
+                    // Only a split consumer that advances the shared cursor in free() does so here;
+                    // a pending-tracked V2C consumer already advanced it in wait(), and a NO_SPLIT
+                    // consumer advances its own per-lane/search cursor in wait() and must not touch
+                    // the shared next_consumer_slot here (it is shared with the other direction).
+                    bool advanceConsumerCursor = false;
+                    if constexpr (kBothDir) {
+                        advanceConsumerCursor = (Split != TileSplitAxis::TILE_NO_SPLIT) && !pendingSlotTracked;
+                    } else if constexpr (Split != TileSplitAxis::TILE_NO_SPLIT && !(TPipe::is_v2c && !TPipe::is_c2v)) {
+                        advanceConsumerCursor = true;
+                    }
+                    if (advanceConsumerCursor) {
                         shared_state.next_consumer_slot = (freeTileIndex + 1) % RingFiFo::SLOT_NUM;
                     }
                     --shared_state.occupied;
