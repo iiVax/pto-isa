@@ -303,4 +303,14 @@ bool ResultCmp(const std::vector<T> &outDataValExp, const std::vector<T> &outDat
                      testNum);
 }
 
+#if (defined(PTO_NPU_ARCH_KIRIN9030) || defined(PTO_NPU_ARCH_KIRINX90)) && defined(PTO_RUN_MODE_NPU)
+ACL_FUNC_VISIBILITY aclError aclrtMemset(void *devPtr, size_t maxCount, int32_t value, size_t count)
+{
+    (void)devPtr;
+    (void)maxCount;
+    (void)value;
+    (void)count;
+    return ACL_SUCCESS;
+}
+#endif
 } // namespace PtoTestCommon
